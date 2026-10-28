@@ -17,6 +17,10 @@ import (
 // queueSize 是请求队列容量：满了以后客户端会在 queue <- 上等待，且随时可被取消。
 const queueSize = 128
 
+// writeTimeout 是「把应答写给客户端」的上限。客户端连上却不读时，
+// 写会卡在 socket 缓冲区上，拖住该连接与整体关停。
+var writeTimeout = 5 * time.Second
+
 type server struct {
 	listener net.Listener
 	upstream *upstream
@@ -426,7 +430,13 @@ func (s *server) client(ctx context.Context, conn net.Conn) {
 				log.Printf("request failed: %s", resp.err)
 				return
 			}
-			if _, err := conn.Write(resp.data); err != nil {
+			if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+				log.Printf("failed to set write deadline: %s", err)
+			}
+			_, err := conn.Write(resp.data)
+			// 无论成败都清掉期限，否则同一连接的下一次写会带着旧期限
+			_ = conn.SetWriteDeadline(time.Time{})
+			if err != nil {
 				log.Printf("failed to write to ssh: %s", err)
 				return
 			}

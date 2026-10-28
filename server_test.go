@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -496,6 +497,75 @@ func TestServerUpstreamUnavailable(t *testing.T) {
 			t.Errorf("request should fail with EOF (round %d): n=%d err=%v", i, n, err)
 		}
 		sock.Close()
+	}
+}
+
+// TestServerWriteTimeout：客户端连上却不读响应时，写回必须在 writeTimeout 后放弃，
+// 不能把该连接与关停一起拖住（TODO #11）。
+func TestServerWriteTimeout(t *testing.T) {
+	// writeTimeout 是包级变量：必须在启动 server 之前设置，
+	// 并把还原注册得比 server 的 cleanup 更早（LIFO ⇒ 最后执行）
+	timeoutBackup := writeTimeout
+	t.Cleanup(func() { writeTimeout = timeoutBackup })
+
+	tmpDir := setupDummyEnv(t)
+	writeDummyPowerShell(t, tmpDir)
+	writeTimeout = 200 * time.Millisecond
+	path := startDummyServer(t, tmpDir, powershellPath())
+
+	sock, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+	defer sock.Close()
+
+	// 预热：先让上游管道建好，后面的大响应才会立刻开始写（否则要等 PowerShell 启动）
+	if got := serverRoundTrip(t, sock, "hello"); got != "HELLO" {
+		t.Fatalf("warm-up failed, got %q", got)
+	}
+
+	// 1 MiB 的请求（上限）：假上游大写回显同等大小，一定塞满两级 socket 缓冲区
+	payload := bytes.Repeat([]byte("a"), maxMessageSize)
+	frame := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(frame, uint32(len(payload)))
+	copy(frame[4:], payload)
+	if _, err := sock.Write(frame); err != nil {
+		t.Fatalf("failed to communicate: %v", err)
+	}
+
+	// 关键：这段时间【完全不读】，让服务端的写卡在缓冲区上并触发超时。
+	// 等待量 = writeTimeout 的 5 倍，给慢机器留余量。
+	time.Sleep(5 * writeTimeout)
+
+	// 服务端此时应已关闭连接：读到的是缓冲区里那部分 + EOF，字节数必然少于完整响应
+	if err := sock.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	buf := make([]byte, 64*1024)
+	for {
+		n, err := sock.Read(buf)
+		total += n
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("connection should be closed after write timeout, got %d bytes and no EOF", total)
+		}
+		break
+	}
+	if total >= 4+maxMessageSize {
+		t.Errorf("write should have been aborted, but the whole %d-byte response arrived", total)
+	}
+
+	// 守护进程存活，新连接照常服务（说明超时只影响该连接）
+	sock2, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("daemon should stay alive: %v", err)
+	}
+	defer sock2.Close()
+	if got := serverRoundTrip(t, sock2, "hello"); got != "HELLO" {
+		t.Errorf("daemon should still serve requests, got %q", got)
 	}
 }
 

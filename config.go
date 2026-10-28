@@ -39,7 +39,9 @@ type config struct {
 const shutdownGrace = 5 * time.Second
 
 // stopTimeout 是 -stop 等待进程消失的上限。
-const stopTimeout = 5 * time.Second
+// 必须比 shutdownGrace 长：否则 -stop 会撞上守护进程兜底自杀的那一刻判超时，
+// 而在 systemd 下 os.Exit(1) 又会触发 Restart=on-failure，把刚停掉的进程拉起来。
+const stopTimeout = shutdownGrace + 5*time.Second
 
 var version = "(development version)"
 var logOutput io.Writer
