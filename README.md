@@ -80,7 +80,7 @@ Run `wsl2-ssh-agent -h` for the full list. The ones worth knowing:
 | `-socket` | `$HOME/.ssh/wsl2-ssh-agent.sock` | UNIX domain socket to listen on |
 | `-pipename` | `openssh-ssh-agent` | Windows named pipe to connect (see the pageant tip below) |
 | `-request-timeout` | `0` (no timeout) | Give up on a single agent request after this long. That request fails and its connection is closed; it is **never** retried upstream. Leave it at `0` to behave like `ssh.exe` on Windows (cancel with Ctrl+C). |
-| `-stop` | | Stop the running daemon and exit |
+| `-stop` | | Stop the running daemon and exit. The daemon records its pid in `<socket>.pid`, which is preferred over probing the socket (a reused pid must not be signalled). |
 | `-foreground` | `false` | Do not daemonize (used by the systemd unit) |
 | `-verbose`, `-log FILE` | | More logs, and/or write logs to a file |
 

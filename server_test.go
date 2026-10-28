@@ -49,6 +49,15 @@ func startDummyServer(t *testing.T, tmpDir string, powershell string) string {
 func startDummyServerWithCancel(t *testing.T, tmpDir string, powershell string, requestTimeout time.Duration) (string, func()) {
 	t.Helper()
 
+	_, path, stop := startDummyServerWithServer(t, tmpDir, powershell, requestTimeout)
+	return path, stop
+}
+
+// startDummyServerWithServer 同 startDummyServerWithCancel，但额外返回守护进程本身，
+// 便于测试直接观察内部状态（例如队列长度），避免用固定睡眠去猜时序。
+func startDummyServerWithServer(t *testing.T, tmpDir string, powershell string, requestTimeout time.Duration) (*server, string, func()) {
+	t.Helper()
+
 	t.Setenv("DUMMY_PS_PIDFILE", filepath.Join(tmpDir, "pid"))
 	t.Setenv("DUMMY_PS_LOGFILE", filepath.Join(tmpDir, "recv.log"))
 
@@ -73,7 +82,7 @@ func startDummyServerWithCancel(t *testing.T, tmpDir string, powershell string, 
 	}
 	t.Cleanup(stop)
 
-	return path, stop
+	return s, path, stop
 }
 
 // TestServerCancelDuringHandshake：建管道（握手）期间客户端断开时，
@@ -99,7 +108,8 @@ func TestServerCancelDuringHandshake(t *testing.T) {
 	if _, err := sock.Write([]byte("\x00\x00\x00\x05hello")); err != nil {
 		t.Fatalf("failed to communicate: %v", err)
 	}
-	time.Sleep(100 * time.Millisecond) // 让调度层进入握手阶段
+	// 等到上游进程真的起来了（即调度层已进入握手），再断开；不用固定睡眠
+	waitForFile(t, filepath.Join(tmpDir, "pid"))
 	if err := sock.Close(); err != nil {
 		t.Fatalf("failed to close: %v", err)
 	}
@@ -121,6 +131,48 @@ func TestServerCancelDuringHandshake(t *testing.T) {
 		t.Fatalf("daemon should stay alive: %v", err)
 	}
 	defer sock2.Close()
+}
+
+// waitForUpstreamDead 轮询等到读循环发现管道已断。
+func waitForUpstreamDead(t *testing.T, srv *server) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !srv.upstream.healthy() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("the upstream pipeline should be reported dead")
+}
+
+// waitForQueueLen 轮询等队列长度达到 want（不用固定睡眠）。
+func waitForQueueLen(t *testing.T, srv *server, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(srv.queue) >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("queue should hold %d request(s), got %d", want, len(srv.queue))
+}
+
+// waitForFile 等一个文件出现（避免用固定睡眠）。
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%s should appear", path)
 }
 
 // waitForNoProcess 等到假 PowerShell 进程全部消失。
@@ -229,7 +281,9 @@ func TestServerMultipleAccess(t *testing.T) {
 // TestServerRestart 验证上游空闲时崩溃：守护进程存活，
 // 下一条请求会在写入前重建管道并正常完成（I1/I3/I4）。
 func TestServerRestart(t *testing.T) {
-	path := setupDummyServer(t)
+	tmpDir := setupDummyEnv(t)
+	writeDummyPowerShell(t, tmpDir)
+	srv, path, _ := startDummyServerWithServer(t, tmpDir, powershellPath(), 0)
 
 	sock, err := net.Dial("unix", path)
 	if err != nil {
@@ -253,7 +307,8 @@ func TestServerRestart(t *testing.T) {
 	if err := proc.Signal(os.Interrupt); err != nil {
 		t.Fatal("failed to kill the process")
 	}
-	time.Sleep(500 * time.Millisecond) // 留给读循环发现管道已断
+	// 等读循环发现管道已断（避免固定睡眠猜测时序）
+	waitForUpstreamDead(t, srv)
 
 	// 下一条请求必须在写入前换成新管道，而不是撞到死进程上
 	if _, err := sock.Write([]byte("\x00\x00\x00\x05Hello")); err != nil {
@@ -337,7 +392,9 @@ func TestServerCancelKillsPipeline(t *testing.T) {
 // TestServerQueuedRequestCancelled：请求还在排队时客户端就断开，该请求从不写入上游（I1/T7）；
 // 同时验证一条卡住的请求只影响它自己，后来的请求能排队并在管道重建后完成（I3/T4）。
 func TestServerQueuedRequestCancelled(t *testing.T) {
-	path := setupDummyServer(t)
+	tmpDir := setupDummyEnv(t)
+	writeDummyPowerShell(t, tmpDir)
+	srv, path, _ := startDummyServerWithServer(t, tmpDir, powershellPath(), 0)
 
 	// A：占住唯一的管道（上游挂起，永不应答）
 	clientA, err := net.Dial("unix", path)
@@ -358,7 +415,7 @@ func TestServerQueuedRequestCancelled(t *testing.T) {
 	if _, err := clientB.Write([]byte("\x00\x00\x00\x06queued")); err != nil {
 		t.Fatalf("failed to communicate: %v", err)
 	}
-	time.Sleep(100 * time.Millisecond) // 确保 B 的请求已入队
+	waitForQueueLen(t, srv, 1) // B 的请求真的入队了（而不是被固定睡眠掩盖）
 	if err := clientB.Close(); err != nil {
 		t.Fatalf("failed to close: %v", err)
 	}
@@ -497,6 +554,65 @@ func TestServerUpstreamUnavailable(t *testing.T) {
 			t.Errorf("request should fail with EOF (round %d): n=%d err=%v", i, n, err)
 		}
 		sock.Close()
+	}
+}
+
+// TestServerKillTimeout：上游派生的子进程持住 stdout 时，读循环永远等不到 EOF；
+// kill() 必须在 killTimeout 后放弃等待，不能让调度层卡死（TODO #1）。
+func TestServerKillTimeout(t *testing.T) {
+	// killTimeout 是包级变量：启动 server 之前设置，还原注册得比 server 的 cleanup 更早
+	timeoutBackup := killTimeout
+	t.Cleanup(func() { killTimeout = timeoutBackup })
+
+	tmpDir := setupDummyEnv(t)
+	writeDummyPowerShell(t, tmpDir)
+	killTimeout = 300 * time.Millisecond
+	childPidFile := filepath.Join(tmpDir, "child.pid")
+	t.Setenv("DUMMY_PS_CHILDPIDFILE", childPidFile)
+	// 清理 fork 出来的孤儿进程（它持着旧管道，与测试无关）
+	t.Cleanup(func() {
+		if buf, err := os.ReadFile(childPidFile); err == nil {
+			var pid int
+			if _, err := fmt.Sscanf(string(buf), "%d", &pid); err == nil {
+				if proc, err := os.FindProcess(pid); err == nil {
+					_ = proc.Kill()
+				}
+			}
+		}
+	})
+	path := startDummyServer(t, tmpDir, powershellPath())
+
+	sock, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+
+	// fork：假上游派生子进程继承 stdout，然后自己挂起
+	if _, err := sock.Write([]byte("\x00\x00\x00\x04fork")); err != nil {
+		t.Fatalf("failed to communicate: %v", err)
+	}
+	waitForReceived(t, path, 1)
+	// recv.log 先于子进程 pid 文件落盘，等它出现后再断开，否则 cleanup 杀不到孤儿进程
+	waitForFile(t, childPidFile)
+
+	// 客户端断开 ⇒ 取消 ⇒ 调度层 kill 管道
+	if err := sock.Close(); err != nil {
+		t.Fatalf("failed to close: %v", err)
+	}
+
+	// 关键断言：调度层没有被永久卡住 —— 新请求仍能被处理。
+	// 若 kill() 无限等 EOF，这条请求会一直排不上队。
+	sock2, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("daemon should stay alive: %v", err)
+	}
+	defer sock2.Close()
+
+	if err := sock2.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := serverRoundTrip(t, sock2, "hello"); got != "HELLO" {
+		t.Errorf("scheduler should not be blocked by a stuck read loop, got %q", got)
 	}
 }
 

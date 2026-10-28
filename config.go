@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -104,6 +105,12 @@ func newConfig() *config {
 	return c
 }
 
+// shellQuote 用单引号包住路径，并把路径里的每个单引号替换成「闭引号+转义+开引号」，
+// 这样 socket 路径含空格或引号时 eval 也安全。
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 func getOutputFormat(format string) string {
 	if format == "auto" {
 		shell := os.Getenv("SHELL")
@@ -139,17 +146,19 @@ func (c *config) start() context.Context {
 	parent := checkDaemonMode()
 
 	// script output
-	c.output = fmt.Sprintf(getOutputFormat(c.format), c.socketPath)
+	c.output = fmt.Sprintf(getOutputFormat(c.format), shellQuote(c.socketPath))
 
 	// set up the log file
 	c.setupLogFile()
 
-	// check if wsl2-ssl-agent is already running
-	serverPid := findRunningServerPid(c.socketPath)
+	// check if wsl2-ssh-agent is already running
+	serverPid := findDaemonPid(c.socketPath)
 
 	// --stop option
 	if c.stop {
 		if serverPid == -1 {
+			// pid/socket 指向的进程已经不在了：把残留文件清掉，再报未运行
+			removePidFile(c.socketPath)
 			fatal("failed to find a running wsl2-ssh-agent (socket: %s)", c.socketPath)
 		}
 
@@ -157,6 +166,7 @@ func (c *config) start() context.Context {
 		if err := stopService(serverPid); err != nil {
 			fatal("%s", err)
 		}
+		removePidFile(c.socketPath)
 		os.Exit(0)
 	}
 
@@ -249,6 +259,51 @@ func (c *config) setupLogFile() {
 	}
 	log.SetOutput(logOutput)
 	log.SetPrefix("[L] ")
+}
+
+// pidFilePath 是守护进程记录自身 pid 的位置（与 socket 同目录）。
+func pidFilePath(socketPath string) string {
+	return socketPath + ".pid"
+}
+
+// writePidFile 让 -stop 能直接找到本进程，不必依赖 socket 探测。
+func writePidFile(socketPath string) error {
+	return os.WriteFile(pidFilePath(socketPath), []byte(strconv.Itoa(os.Getpid())), 0600)
+}
+
+func removePidFile(socketPath string) {
+	_ = os.Remove(pidFilePath(socketPath))
+}
+
+// readPidFile 读出 pid 文件里的 pid；文件不存在或内容异常时返回 false。
+func readPidFile(socketPath string) (int, bool) {
+	buf, err := os.ReadFile(pidFilePath(socketPath))
+	if err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(buf)))
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
+}
+
+// isOurDaemon 确认 pid 确实是 wsl2-ssh-agent：只看 /proc/<pid>/exe，否则 `vim wsl2-ssh-agent.go`
+// 这类进程也会被误判；读不到时返回 false——宁可退回 socket 探测，也不猜。
+func isOurDaemon(pid int) bool {
+	target, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(filepath.Base(target), "wsl2-ssh-agent")
+}
+
+// findDaemonPid 依次尝试：pid 文件 → socket 探测。返回 -1 表示没有在运行。
+func findDaemonPid(socketPath string) int {
+	if pid, ok := readPidFile(socketPath); ok && isOurDaemon(pid) {
+		return pid
+	}
+	return findRunningServerPid(socketPath)
 }
 
 // find the existing server by getsockopt

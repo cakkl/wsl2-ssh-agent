@@ -21,6 +21,10 @@ const queueSize = 128
 // 写会卡在 socket 缓冲区上，拖住该连接与整体关停。
 var writeTimeout = 5 * time.Second
 
+// killTimeout 是 kill() 等待读循环退出的上限：脚本若派生了继承 stdout 的子进程，
+// EOF 永远不会来，无限等会让调度层卡住、后续请求全部排队。
+var killTimeout = 5 * time.Second
+
 type server struct {
 	listener net.Listener
 	upstream *upstream
@@ -293,6 +297,13 @@ func (u *upstream) drop(p *pipeline) {
 	u.mu.Unlock()
 }
 
+// healthy 表示当前是否有一条可用管道（没有管道或管道已死都返回 false）。
+func (u *upstream) healthy() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.cur != nil && u.cur.alive()
+}
+
 func (u *upstream) closeAll() {
 	u.mu.Lock()
 	p := u.cur
@@ -314,6 +325,7 @@ type pipeline struct {
 	dead      chan struct{} // 读循环结束或被 kill 时关闭（表示不可再用）
 	done      chan struct{} // 读循环已退出
 	closeOnce sync.Once
+	killOnce  sync.Once // 保证 kill 只实际执行一次
 }
 
 func newPipeline(ctx context.Context, powershell string, pipename string) (*pipeline, error) {
@@ -370,18 +382,25 @@ func (p *pipeline) alive() bool {
 // kill 同时是「取消」和「回收」：关闭命名管道让 Agent 感知断开（取消待处理弹窗），
 // 再杀掉 PowerShell——脚本阻塞在 Windows 侧管道读上，只能靠进程退出中断。幂等。
 func (p *pipeline) kill() {
-	p.markDead()
+	p.killOnce.Do(func() {
+		p.markDead()
 
-	_ = p.in.Close()
-	if p.cmd.Process != nil {
-		if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			log.Printf("failed to kill [W]: %s", err)
+		_ = p.in.Close()
+		if p.cmd.Process != nil {
+			if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				log.Printf("failed to kill [W]: %s", err)
+			}
 		}
-	}
 
-	// os/exec 要求 StdoutPipe 读完之后才能 Wait
-	<-p.done
-	_ = p.cmd.Wait()
+		// 读循环可能永远等不到 EOF（见 killTimeout）；交给 Wait 关掉管道让它自行返回
+		select {
+		case <-p.done:
+		case <-time.After(killTimeout):
+			log.Printf("read loop did not finish within %v; closing the pipe anyway", killTimeout)
+		}
+
+		_ = p.cmd.Wait()
+	})
 }
 
 // client 服务一条 SSH 客户端连接：一个读 goroutine + 一个处理循环。

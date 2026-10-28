@@ -12,15 +12,18 @@ import (
 //
 // DUMMY_PS_MODE=agent（默认）按消息体决定行为：
 //
-//	fail       退出进程（上游崩溃）      linkfail  回链路级失败哨兵（连不上 agent）
-//	stuck      永不回复（上游挂起）      slow:<ms> 延迟后回复
-//	count      回复本进程已处理的请求数   其他      大写回显
+//	fail      退出进程（上游崩溃）        linkfail  回链路级失败哨兵
+//	stuck     永不回复（上游挂起）        slow:<ms> 延迟后回复
+//	fork      子进程持住 stdout 后挂起    count     回复已处理条数
+//	其他      大写回显
 //
 // DUMMY_PS_MODE=echo 原样回显 stdin；silent 读满 stdin 后退出（握手失败）。
-// 另有 DUMMY_PS_SRC_LEN（脚本字节数）、DUMMY_PS_PIDFILE、DUMMY_PS_LOGFILE（收到的消息）。
+// 另有 DUMMY_PS_SRC_LEN（脚本字节数）、DUMMY_PS_PIDFILE、DUMMY_PS_LOGFILE（收到的消息）、
+// DUMMY_PS_CHILDPIDFILE（fork 模式下子进程的 pid，便于测试清理孤儿进程）。
 const dummyPowerShellScript = `#!/usr/bin/env python3
 import os
 import struct
+import subprocess
 import sys
 import time
 
@@ -28,6 +31,7 @@ MODE = os.environ.get("DUMMY_PS_MODE") or "agent"
 SRC_LEN = int(os.environ.get("DUMMY_PS_SRC_LEN") or "0")
 PIDFILE = os.environ.get("DUMMY_PS_PIDFILE") or ""
 LOGFILE = os.environ.get("DUMMY_PS_LOGFILE") or ""
+CHILDPIDFILE = os.environ.get("DUMMY_PS_CHILDPIDFILE") or ""
 
 inp = sys.stdin.buffer
 out = sys.stdout.buffer
@@ -101,6 +105,15 @@ while True:
     record("recv %s" % body.decode("utf-8", "replace"))
     if body == b"fail":
         sys.exit(0)
+    if body == b"fork":
+        # 派生子进程并让它继承 stdout：父进程被杀后写端仍被持有，
+        # 读循环永远等不到 EOF（验证 kill 不能无限等）
+        child = subprocess.Popen(["sleep", "3600"])
+        if CHILDPIDFILE:
+            with open(CHILDPIDFILE, "w") as f:
+                f.write(str(child.pid))
+        while True:
+            time.sleep(3600)
     if body == b"linkfail":
         # 模拟 repeater.ps1 的链路级失败哨兵（长度 1、类型 0xFF）
         send(b"\xff")
