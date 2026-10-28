@@ -2,32 +2,24 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"os"
-	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
 
-const dummyBrokenPowerShell = `#!/usr/bin/ruby
-$stdin.read
-`
-
-const dummyEchoPowerShell = `#!/usr/bin/ruby
-$stdout.sync = true
-$stdout << "Warning: Some dummy ramdom warming messages ... Dummy ...\n"
-$stdout << "\xff"
-loop do
-  $stdout << $stdin.getc
-end
-`
-
 func setupDummyEnv(t *testing.T) string {
 	t.Helper()
 	log.SetOutput(io.Discard)
+	requirePython(t)
 	tmpDir := t.TempDir()
-	t.Setenv("PATH", tmpDir)
+	// 保留原 PATH，便于假 powershell.exe 的 #!/usr/bin/env python3 可用；
+	// tmpDir 放在最前，确保 powershellPath() 命中假 powershell.exe
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DUMMY_PS_SRC_LEN", strconv.Itoa(len(repeaterPs1)))
 	waitTimesBackup := waitTimes
 	waitTimes = []time.Duration{0 * time.Second, 500 * time.Millisecond, 3 * time.Second}
 
@@ -49,28 +41,49 @@ func TestRepeaterNoPowerShell(t *testing.T) {
 func TestRepeaterBrokenPowerShell(t *testing.T) {
 	tmpDir := setupDummyEnv(t)
 
-	err := os.WriteFile(filepath.Join(tmpDir, "powershell.exe"), []byte(dummyBrokenPowerShell), 0777)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = newRepeater(context.Background(), powershellPath(), "dummy-pipe-name")
+	writeDummyPowerShell(t, tmpDir)
+	t.Setenv("DUMMY_PS_MODE", "silent")
+
+	_, err := newRepeater(context.Background(), powershellPath(), "dummy-pipe-name")
 	if err == nil || err.Error() != "failed to invoke PowerShell.exe 3 times; give up" {
 		t.Errorf("should fail")
+	}
+}
+
+// TestRepeaterCtxCancelled：握手阶段必须能被 ctx 打断（原 D5）。
+func TestRepeaterCtxCancelled(t *testing.T) {
+	tmpDir := setupDummyEnv(t)
+
+	writeDummyPowerShell(t, tmpDir)
+	t.Setenv("DUMMY_PS_MODE", "silent") // 永不输出就绪字节
+
+	// 把每轮等待拉长，确保只能靠 ctx 退出（setupDummyEnv 的 cleanup 会还原）
+	waitTimes = []time.Duration{time.Hour, time.Hour, time.Hour}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+
+	start := time.Now()
+	_, err := newRepeater(ctx, powershellPath(), "dummy-pipe-name")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("should return context.Canceled, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("cancellation should be prompt, took %v", elapsed)
 	}
 }
 
 func TestRepeaterNormal(t *testing.T) {
 	tmpDir := setupDummyEnv(t)
 
-	err := os.WriteFile(filepath.Join(tmpDir, "powershell.exe"), []byte(dummyEchoPowerShell), 0777)
-	if err != nil {
-		t.Fatal(err)
-	}
+	writeDummyPowerShell(t, tmpDir)
+	t.Setenv("DUMMY_PS_MODE", "echo")
 
 	rep, err := newRepeater(context.Background(), powershellPath(), "dummy-pipe-name")
 	if err != nil {
-		t.Errorf("failed: %s", err)
+		t.Fatalf("failed: %s", err)
 	}
+	defer rep.terminate()
 
 	buf := make([]byte, len(repeaterPs1))
 	_, err = io.ReadFull(rep.out, buf)
@@ -93,6 +106,4 @@ func TestRepeaterNormal(t *testing.T) {
 	if err != nil || string(buf) != "Hello" {
 		t.Errorf("does not work")
 	}
-
-	rep.terminate()
 }

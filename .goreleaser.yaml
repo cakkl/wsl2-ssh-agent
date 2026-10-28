@@ -1,3 +1,5 @@
+version: 2
+
 before:
   hooks:
     - go mod tidy
@@ -11,7 +13,7 @@ builds:
       - arm64
 
 archives:
-  - format: binary
+  - formats: [binary]
     name_template: >-
       {{ .ProjectName }}{{- if eq .Arch "arm64" }}-{{ .Arch }}{{ end }}
 checksum:

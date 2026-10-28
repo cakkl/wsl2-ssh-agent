@@ -71,6 +71,49 @@ Make the directory if necessary.
 Close and reopen the terminal.
 You should now be able to run `ssh your-server` and connect using the SSH keys managed by the Windows ssh-agent.exe service.
 
+## Options
+
+Run `wsl2-ssh-agent -h` for the full list. The ones worth knowing:
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `-socket` | `$HOME/.ssh/wsl2-ssh-agent.sock` | UNIX domain socket to listen on |
+| `-pipename` | `openssh-ssh-agent` | Windows named pipe to connect (see the pageant tip below) |
+| `-request-timeout` | `0` (no timeout) | Give up on a single agent request after this long. That request fails and its connection is closed; it is **never** retried upstream. Leave it at `0` to behave like `ssh.exe` on Windows (cancel with Ctrl+C). |
+| `-stop` | | Stop the running daemon and exit. The daemon records its pid in `<socket>.pid`, which is preferred over probing the socket (a reused pid must not be signalled). |
+| `-foreground` | `false` | Do not daemonize (used by the systemd unit) |
+| `-verbose`, `-log FILE` | | More logs, and/or write logs to a file |
+
+Note on cancellation: pressing Ctrl+C (or killing `ssh`) closes the UNIX socket,
+which makes wsl2-ssh-agent drop its named-pipe connection to the Windows agent immediately.
+This is what dismisses a pending authorization dialog in Bitwarden etc. Requests are never
+silently retried, so a failure surfaces as a normal agent error in `ssh`.
+
+Note on a missing Windows agent: if the Windows named pipe does not exist (Bitwarden or
+`ssh-agent.exe` not running), the request fails immediately and the client sees a *transport*
+error, not a refusal:
+
+```
+$ ssh-add -l
+<error fetching identities: communication with agent failed>   # agent 不在
+$ ssh-add -l
+<error fetching identities: agent refused operation>          # agent 在、但他拒绝了
+```
+
+The daemon log says why: `named pipe '<name>' does not exist (is Bitwarden / ssh-agent running?)`.
+A pipe that exists but does not answer is *not* timed out by default (same as `ssh.exe`);
+use Ctrl+C, or `-request-timeout` if you prefer a hard bound.
+
+> Windows `ssh.exe` prints `Error connecting to agent: No such file or directory` in this case,
+> because there the socket itself is missing. Here the socket has to exist for the daemon to be
+> reachable, so the wording differs — but the class of error ("cannot talk to the agent" vs
+> "the agent said no") is the same.
+
+### Changing the PowerShell bridge script
+
+`repeater.ps1` is compiled into the binary with `go:embed`, so **rebuild and restart the
+daemon after editing it** (`wsl2-ssh-agent -stop`, rebuild, then start again).
+
 ## Tip: Using with pageant.exe
 
 If you want to use the named pipe provided by pageant.exe, you can use the `-pipename` option.
