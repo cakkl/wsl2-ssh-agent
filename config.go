@@ -36,12 +36,13 @@ type config struct {
 	childPipe *os.File
 }
 
-// shutdownGrace 是「收到信号后仍未退出」的兜底时限。
-const shutdownGrace = 5 * time.Second
+// shutdownGrace 是「收到信号后仍未退出」的兜底时限，必须大于关停路径上
+// writeTimeout + killTimeout + waitDelay 之和（见 TestTimeoutBudget）：
+// 否则兜底的 os.Exit(1) 抢先触发，systemd 会把刚停掉的进程重新拉起。
+const shutdownGrace = 20 * time.Second
 
 // stopTimeout 是 -stop 等待进程消失的上限。
-// 必须比 shutdownGrace 长：否则 -stop 会撞上守护进程兜底自杀的那一刻判超时，
-// 而在 systemd 下 os.Exit(1) 又会触发 Restart=on-failure，把刚停掉的进程拉起来。
+// 必须比 shutdownGrace 长，否则 -stop 会撞上守护进程兜底自杀的那一刻判超时。
 const stopTimeout = shutdownGrace + 5*time.Second
 
 var version = "(development version)"

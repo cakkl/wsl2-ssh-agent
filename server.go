@@ -452,7 +452,13 @@ func (s *server) client(ctx context.Context, conn net.Conn) {
 			if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
 				log.Printf("failed to set write deadline: %s", err)
 			}
+			// 连接被取消（客户端断了 / 守护进程关停）时立刻打断这次写，
+			// 不必等满 writeTimeout —— 否则关停会白白多耗几秒
+			abort := context.AfterFunc(connCtx, func() {
+				_ = conn.SetWriteDeadline(time.Now())
+			})
 			_, err := conn.Write(resp.data)
+			abort()
 			// 无论成败都清掉期限，否则同一连接的下一次写会带着旧期限
 			_ = conn.SetWriteDeadline(time.Time{})
 			if err != nil {

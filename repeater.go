@@ -27,12 +27,18 @@ var waitTimes = []time.Duration{
 	10 * time.Second,
 }
 
+// waitDelay 是 exec.Cmd 等待 I/O 复制结束的上限。cmd.Stderr 不是 *os.File，
+// os/exec 会起 io.Copy goroutine 转发；脚本派生的子进程若继承 stderr，EOF 永不到来，
+// Wait 就会无限阻塞（实测卡 11 s）。
+var waitDelay = 5 * time.Second
+
 // invoke PowerShell.exe and run
 func newRepeater(ctx context.Context, powershell string, pipename string) (*repeater, error) {
 	for i, limit := range waitTimes {
 		log.Printf("invoking [W] in PowerShell.exe%s", trial(i))
 
 		cmd := exec.Command(powershell, "-Command", "-")
+		cmd.WaitDelay = waitDelay
 		in, err := cmd.StdinPipe()
 		if err != nil {
 			continue

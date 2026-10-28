@@ -8,6 +8,20 @@ import (
 	"testing"
 )
 
+// TestTimeoutBudget：几个超时常量之间存在硬性大小关系，改单个值很容易破坏，
+// 破坏后的症状是「正常 -stop 却以退出码 1 结束」，systemd 会把进程重新拉起。
+func TestTimeoutBudget(t *testing.T) {
+	// 关停最坏耗时 = 等客户端把应答写完 + 等读循环退出 + 等 exec 的 I/O 复制结束
+	if worst := writeTimeout + killTimeout + waitDelay; shutdownGrace <= worst {
+		t.Errorf("shutdownGrace (%v) must exceed writeTimeout+killTimeout+waitDelay (%v), "+
+			"otherwise the grace exit fires before shutdown completes", shutdownGrace, worst)
+	}
+	// -stop 必须比守护进程自己的兜底更晚放弃
+	if stopTimeout <= shutdownGrace {
+		t.Errorf("stopTimeout (%v) must exceed shutdownGrace (%v)", stopTimeout, shutdownGrace)
+	}
+}
+
 // TestOutputFormatQuoting：socket 路径要按 shell 规则加引号，含空格/单引号时 eval 也不能坏。
 func TestOutputFormatQuoting(t *testing.T) {
 	const path = "/tmp/a b.sock"
