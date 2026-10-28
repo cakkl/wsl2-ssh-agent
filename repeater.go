@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"time"
 )
@@ -55,7 +57,7 @@ func newRepeater(ctx context.Context, powershell string, pipename string) (*repe
 			continue
 		}
 
-		done := make(chan bool)
+		done := make(chan bool, 1)
 
 		// wait for the process start up
 		go func() {
@@ -95,6 +97,11 @@ func newRepeater(ctx context.Context, powershell string, pipename string) (*repe
 				return &repeater{in, out, cmd}, nil
 			}
 		case <-time.After(limit):
+		case <-ctx.Done():
+			// 关停中：握手没必要继续等，直接把这一轮收掉
+			log.Printf("aborted while invoking [W]: %s", ctx.Err())
+			terminate(cmd)
+			return nil, ctx.Err()
 		}
 
 		log.Printf("PowerShell.exe does not respond in %v", limit)
@@ -104,12 +111,15 @@ func newRepeater(ctx context.Context, powershell string, pipename string) (*repe
 	return nil, fmt.Errorf("failed to invoke PowerShell.exe %d times; give up", len(waitTimes))
 }
 
+// terminate 杀掉 PowerShell 并回收它的资源。
+// 任何失败只记日志：请求路径上绝不能因此结束守护进程（I4，原 D6）。
 func terminate(cmd *exec.Cmd) {
-	err := cmd.Process.Kill()
-	if err != nil {
-		log.Fatal(err)
+	if cmd.Process != nil {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			log.Printf("failed to kill [W]: %s", err)
+		}
 	}
-	cmd.Wait() //nolint:errcheck
+	_ = cmd.Wait()
 }
 
 func (rep *repeater) terminate() {
